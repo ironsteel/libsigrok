@@ -237,6 +237,12 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/beaglelogic/beaglelogic_native.c \
 	src/hardware/beaglelogic/beaglelogic_tcp.c
 endif
+if HW_BLACKMESALABS_SUMP2
+src_libdrivers_la_SOURCES += \
+	src/hardware/blackmesalabs-sump2/protocol.h \
+	src/hardware/blackmesalabs-sump2/protocol.c \
+	src/hardware/blackmesalabs-sump2/api.c
+endif
 if HW_BRYMEN_BM86X
 src_libdrivers_la_SOURCES += \
 	src/hardware/brymen-bm86x/protocol.h \
