@@ -20,39 +20,88 @@
 #include <config.h>
 #include "protocol.h"
 
+#define SERIALCOMM "921600/8n1"
+
+static const uint32_t scanopts[] = {
+	SR_CONF_CONN,
+	SR_CONF_SERIALCOMM,
+};
+
+static const uint32_t drvopts[] = {
+	SR_CONF_LOGIC_ANALYZER,
+};
+static const uint32_t devopts[] = {
+	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
+	SR_CONF_PATTERN_MODE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_SWAP | SR_CONF_SET,
+	SR_CONF_RLE | SR_CONF_GET | SR_CONF_SET,
+};
+
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
 {
-	struct drv_context *drvc;
-	GSList *devices;
+	struct sr_config *src;
+	struct sr_dev_inst *sdi;
+	struct sr_serial_dev_inst *serial;
+	GSList *l;
+	int ret;
+	unsigned int i;
+	const char *conn, *serialcomm;
 
-	(void)options;
+	conn = serialcomm = NULL;
+	for (l = options; l; l = l->next) {
+		src = l->data;
+		switch (src->key) {
+		case SR_CONF_CONN:
+			conn = g_variant_get_string(src->data, NULL);
+			break;
+		case SR_CONF_SERIALCOMM:
+			serialcomm = g_variant_get_string(src->data, NULL);
+			break;
+		}
+	}
 
-	devices = NULL;
-	drvc = di->context;
-	drvc->instances = NULL;
+	if (!conn) {
+		sr_info("No connection");
+		return NULL;
+	}
 
-	/* TODO: scan for devices, either based on a SR_CONF_CONN option
-	 * or on a USB scan. */
+	if (!serialcomm)
+		serialcomm = SERIALCOMM;
 
-	return devices;
-}
+	serial = sr_serial_dev_inst_new(conn, serialcomm);
+	sr_info("Probing %s.", conn);
 
-static int dev_open(struct sr_dev_inst *sdi)
-{
-	(void)sdi;
+	if (serial_open(serial, SERIAL_RDWR) != SR_OK) {
+		return NULL;
+	}
 
-	/* TODO: get handle from sdi->conn and open it. */
+	// TODO: tweak the FPGA design to not require this
+	if (sump2_autobaud(serial) != SR_OK) {
+		serial_close(serial);
+		sr_err("Could not autobaud. Quitting.");
+		return NULL;
+	}
 
-	return SR_OK;
-}
+	int hwid_data = sump2_read(serial, SUMP2_READ_HWID);
 
-static int dev_close(struct sr_dev_inst *sdi)
-{
-	(void)sdi;
+	int hwid = (hwid_data & 0xFFFF0000) >> 16;
+	if (hwid != SUMP2_HWID) {
+		sr_err("Unable to locate sump2 hardware, invalid hardware id (expected %x, got %x)", SUMP2_HWID, hwid);
+		return NULL;
+	}
 
-	/* TODO: get handle from sdi->conn and close it. */
+	sdi = g_malloc0(sizeof(struct sr_dev_inst));
+	sdi->status = SR_ST_INACTIVE;
+	sdi->vendor = g_strdup("Black Mesa SUMP2");
+	sdi->model = g_strdup("Logic Analyzer");
+	sdi->inst_type = SR_INST_SERIAL;
+	sdi->conn = serial;
+	sdi->priv = sump2_dev_new();
 
-	return SR_OK;
+	serial_close(serial);
+
+	return std_scan_complete(di, g_slist_append(NULL, sdi));
 }
 
 static int config_get(uint32_t key, GVariant **data,
@@ -96,20 +145,15 @@ static int config_set(uint32_t key, GVariant *data,
 static int config_list(uint32_t key, GVariant **data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
-	int ret;
-
-	(void)sdi;
-	(void)data;
-	(void)cg;
-
-	ret = SR_OK;
 	switch (key) {
-	/* TODO */
+	case SR_CONF_SCAN_OPTIONS:
+	case SR_CONF_DEVICE_OPTIONS:
+		return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
 	default:
 		return SR_ERR_NA;
 	}
 
-	return ret;
+	return SR_OK;
 }
 
 static int dev_acquisition_start(const struct sr_dev_inst *sdi)
@@ -143,8 +187,8 @@ SR_PRIV struct sr_dev_driver blackmesalabs_sump2_driver_info = {
 	.config_get = config_get,
 	.config_set = config_set,
 	.config_list = config_list,
-	.dev_open = dev_open,
-	.dev_close = dev_close,
+	.dev_open = std_serial_dev_open,
+	.dev_close = std_serial_dev_close,
 	.dev_acquisition_start = dev_acquisition_start,
 	.dev_acquisition_stop = dev_acquisition_stop,
 	.context = NULL,
