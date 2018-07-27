@@ -30,13 +30,18 @@ static const uint32_t scanopts[] = {
 static const uint32_t drvopts[] = {
 	SR_CONF_LOGIC_ANALYZER,
 };
+
 static const uint32_t devopts[] = {
-	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_LIST,
+	SR_CONF_RLE | SR_CONF_GET,
 	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
-	SR_CONF_PATTERN_MODE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
-	SR_CONF_SWAP | SR_CONF_SET,
-	SR_CONF_RLE | SR_CONF_GET | SR_CONF_SET,
 };
+
+static const int32_t trigger_matches[] = {
+	SR_TRIGGER_RISING,
+	SR_TRIGGER_FALLING,
+};
+
 
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
 {
@@ -98,6 +103,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	sdi->inst_type = SR_INST_SERIAL;
 	sdi->conn = serial;
 	sdi->priv = sump2_dev_new();
+	sump2_init(sdi);
 
 	serial_close(serial);
 
@@ -107,20 +113,27 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 static int config_get(uint32_t key, GVariant **data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
-	int ret;
+	struct dev_context *devc;
 
-	(void)sdi;
-	(void)data;
 	(void)cg;
 
-	ret = SR_OK;
+	if (!sdi)
+		return SR_ERR_ARG;
+
+	devc = sdi->priv;
+
 	switch (key) {
-	/* TODO */
+	case SR_CONF_SAMPLERATE:
+		*data = g_variant_new_uint64(devc->samplerate);
+		break;
+	case SR_CONF_RLE:
+		*data = g_variant_new_boolean(devc->rle_enabled ? TRUE : FALSE);
+		break;
 	default:
 		return SR_ERR_NA;
 	}
 
-	return ret;
+	return SR_OK;
 }
 
 static int config_set(uint32_t key, GVariant *data,
@@ -145,10 +158,22 @@ static int config_set(uint32_t key, GVariant *data,
 static int config_list(uint32_t key, GVariant **data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
+	struct dev_context *devc;
+	uint64_t samplerates[1];
+
+	devc = sdi->priv;
+
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
 		return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
+	case SR_CONF_SAMPLERATE:
+		samplerates[0] = devc->samplerate;
+		*data = std_gvar_samplerates(ARRAY_AND_SIZE(samplerates));
+		break;
+	case SR_CONF_TRIGGER_MATCH:
+		*data = std_gvar_array_i32(ARRAY_AND_SIZE(trigger_matches));
+		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -158,19 +183,78 @@ static int config_list(uint32_t key, GVariant **data,
 
 static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 {
-	/* TODO: configure hardware, reset acquisition state, set up
-	 * callbacks and send header packet. */
+	struct sr_serial_dev_inst* serial;
+	struct dev_context *devc;
 
-	(void)sdi;
+	struct sr_trigger *trigger;
+	struct sr_trigger_stage *stage;
+	struct sr_trigger_match *match;
+	const GSList *l, *m;
 
+	int channelbit, i = 0;
+	
+	devc = sdi->priv;
+	serial = sdi->conn;
+
+	if (!(trigger = sr_session_trigger_get(sdi->session))) {
+		sr_dbg("No session trigger found");
+		return SR_ERR;
+	}
+
+	for (l = trigger->stages; l; l = l->next) {
+		stage = l->data;
+		for (m = stage->matches; m; m = m->next) {
+			match = m->data;
+			if (!match->channel->enabled)
+				/* Ignore disabled channels with a trigger. */
+				continue;
+			channelbit = 1 << (match->channel->index);
+			sr_dbg("Channel trigger match %d", match->channel->index);
+			devc->trigger_field = channelbit;
+			switch (match->match) {
+				case SR_TRIGGER_RISING:
+					devc->trigger_type = trig_or_ris;  
+				break;
+				case SR_TRIGGER_FALLING:
+					devc->trigger_type = trig_or_fal;  
+				break;
+			}
+		}
+	}
+
+	// TODO: Add support for these
+	sump2_write(serial, cmd_wr_user_ctrl, 0x00000000);
+	sump2_write(serial, cmd_wr_watchdog_time, 0x00001000);
+	sump2_write(serial, cmd_wr_user_pattern0, 0x0000FFFF);
+	sump2_write(serial, cmd_wr_user_pattern1, 0x000055FF);
+	sump2_write(serial, cmd_wr_trig_dly_nth, 0x00000001);
+	sump2_write(serial, cmd_wr_rle_event_en, 0xFFFFFFFF); 
+
+	sump2_write(serial, cmd_wr_trig_type, devc->trigger_type);
+	sump2_write(serial, cmd_wr_trig_field, devc->trigger_field);
+	sump2_write(serial, cmd_wr_trig_position, devc->ram_len/2); 
+
+	sump2_write(serial, SUMP2_CMD_STATE_RESET , 0x00000000); 
+	sump2_write(serial, SUMP2_CMD_STATE_ARM , 0x00000000); 
+
+	std_session_send_df_header(sdi);
+
+	//mesabus_read(serial, SUMP2_DATA_ADDR, 0);
+
+	serial_source_add(sdi->session, serial, G_IO_IN, 100,
+			blackmesalabs_sump2_receive_data, (struct sr_dev_inst *)sdi);
 	return SR_OK;
 }
 
 static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 {
-	/* TODO: stop acquisition. */
 
-	(void)sdi;
+	struct sr_serial_dev_inst *serial;
+
+	serial = sdi->conn;
+	serial_source_remove(sdi->session, serial);
+
+	std_session_send_df_end(sdi);
 
 	return SR_OK;
 }

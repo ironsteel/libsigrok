@@ -43,6 +43,82 @@ SR_PRIV struct dev_context *sump2_dev_new(void)
 	return devc;
 }
 
+SR_PRIV int sump2_init(struct sr_dev_inst *sr)
+{
+	struct sr_serial_dev_inst* serial;
+	struct dev_context *devc;
+
+	uint32_t hw_info;
+	uint32_t ram_data;
+	uint32_t samplerate_data;
+	float freq;
+
+	serial = sr->conn;
+	devc = sr->priv;
+
+	hw_info = sump2_read(serial, SUMP2_READ_HWID);
+
+	devc->hw_rev = (hw_info & 0x0000FF00) >> 8;
+	devc->data_en = (hw_info & 0x00000040) >> 6;
+	// TODO: implement support for this
+	devc->trigger_wd_en = (hw_info & 0x00000020) >> 5;
+	devc->nonrle_disabled = (hw_info & 0x00000010) >> 4;
+	devc->rle_enabled = (hw_info & 0x00000008) >> 3;
+	// TODO: implement support for these
+	devc->pattern_en = (hw_info & 0x00000004) >> 2;
+	devc->trigger_nth_en = (hw_info & 0x00000002) >> 1;
+	devc->trigger_delay_en = (hw_info & 0x00000001) >> 0;
+
+	ram_data = sump2_read(serial, SUMP2_READ_RAM_WIDTH);
+
+	devc->ram_len = (ram_data & 0x0000FFFF) >> 0;
+	devc->ram_dwords = (ram_data & 0x00FF0000) >> 14;
+	devc->ram_event_bytes = (ram_data & 0x0F000000) >> 24;
+	devc->ram_rle = ( ram_data  & 0xF0000000) >> 28;
+
+	samplerate_data = sump2_read(serial, SUMP2_READ_SAMPLE_FREQ);
+	devc->samplerate = SR_MHZ(samplerate_data / 65536);
+
+	// TODO: handle trigger position
+	devc->acq_len = 44;
+
+	sump2_init_signal_list(sr);
+
+	sump2_write(serial, cmd_wr_user_ctrl, 0x00000000);
+	sump2_write(serial, cmd_wr_watchdog_time, 0x00001000);
+	sump2_write(serial, cmd_wr_user_pattern0, 0x0000FFFF);
+	sump2_write(serial, cmd_wr_user_pattern1, 0x000055FF);
+	sump2_write(serial, cmd_wr_trig_type, trig_pat_ris);
+	sump2_write(serial, cmd_wr_trig_field, 0x00000000);
+	sump2_write(serial, cmd_wr_trig_dly_nth, 0x00000001);
+	sump2_write(serial, cmd_wr_trig_position, devc->ram_len/2); 
+	sump2_write(serial, cmd_wr_rle_event_en, 0xFFFFFFFF); 
+
+	sump2_write(serial,SUMP2_CMD_STATE_RESET , 0x00000000); 
+
+
+	return SR_OK;
+}
+
+SR_PRIV int sump2_init_signal_list(struct sr_dev_inst *sr)
+{
+	struct sr_serial_dev_inst* serial;
+	struct dev_context *devc;
+	uint32_t num_channels;
+	int i;
+	char chan_name[3];
+
+	serial = sr->conn;
+	devc = sr->priv;
+
+	num_channels = devc->ram_event_bytes * 8;
+
+	for (i = 0; i < num_channels; i++) {
+		sprintf(chan_name, "%d", i);
+		sr_channel_new(sr, i, SR_CHANNEL_LOGIC, TRUE, chan_name);
+	}
+}
+
 SR_PRIV int sump2_autobaud(struct sr_serial_dev_inst *serial)
 {
 	int wrote = serial_write_blocking(serial, "\n", 1, serial_timeout(serial, 1));
@@ -53,6 +129,18 @@ SR_PRIV int sump2_autobaud(struct sr_serial_dev_inst *serial)
 	if (serial_drain(serial) != 0)
 		return SR_ERR;
 
+	return SR_OK;
+}
+
+SR_PRIV int sump2_write(struct sr_serial_dev_inst *serial, uint32_t addr, uint32_t data)
+{
+	if (mesabus_write(serial, SUMP2_CTRL_ADDR, addr) != SR_OK) {
+		return SR_ERR;
+	}
+	
+	if (mesabus_write(serial, SUMP2_DATA_ADDR, data) != SR_OK) {
+		return SR_ERR;
+	}
 	return SR_OK;
 }
 
@@ -86,9 +174,9 @@ SR_PRIV int sump2_read(struct sr_serial_dev_inst *serial, uint32_t addr)
 	strcpy(payload, (buf + strlen(buf)) - 9);
 
 	// Convert hex string payload to int
-	response = strtoul(payload, NULL, 16);
+	response = strtol(payload, NULL, 16);
 	if (errno == ERANGE) {
-		sr_dbg("invalid hex value %s", payload);
+		sr_err("invalid hex value %s", payload);
 		return SR_ERR;
 	}
 
@@ -153,6 +241,7 @@ SR_PRIV int blackmesalabs_sump2_receive_data(int fd, int revents, void *cb_data)
 	const struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 
+	struct sr_serial_dev_inst* serial;
 	(void)fd;
 
 	if (!(sdi = cb_data))
@@ -161,8 +250,13 @@ SR_PRIV int blackmesalabs_sump2_receive_data(int fd, int revents, void *cb_data)
 	if (!(devc = sdi->priv))
 		return TRUE;
 
+	serial = sdi->conn;
+
 	if (revents == G_IO_IN) {
-		/* TODO */
+		//sr_dbg("GOT DATA");
+	} else {
+		mesabus_read(serial, SUMP2_DATA_ADDR, 0);
+		sr_dbg("PROBING");
 	}
 
 	return TRUE;
